@@ -1,3 +1,9 @@
+Unreleased
+==========
+* Added an AIFF/AIFC encoder (`ma_encoding_format_aiff`). Integer PCM (u8, s16, s24, s32) is written as big-endian AIFF and f32 as AIFC with the "fl32" compression code. The output must be seekable; non-seekable output fails with `MA_NOT_IMPLEMENTED` and unsupported sample formats with `MA_INVALID_ARGS`.
+* Decoders initialized with an explicit `ma_encoding_format_aiff` now route through the WAV backend, which already supports AIFF/AIFC decoding.
+
+
 v0.11.26 - 2026-10-31
 =====================
 * Fixed a bug where the ends of sounds are cutoff. This affects `ma_sound`.

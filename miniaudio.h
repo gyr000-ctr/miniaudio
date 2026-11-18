@@ -2659,8 +2659,9 @@ opportunity to clean up and internal data.
 
 9. Encoding
 ===========
-The `ma_encoding` API is used for writing audio files. The only supported output format is WAV.
-This can be disabled by specifying the following option before the implementation of miniaudio:
+The `ma_encoding` API is used for writing audio files. The supported output formats are WAV and
+AIFF/AIFC. This can be disabled by specifying the following option before the implementation of
+miniaudio:
 
     ```c
     #define MA_NO_WAV
@@ -2687,11 +2688,12 @@ When initializing an encoder you must specify a config which is initialized with
 `ma_encoder_config_init()`. Here you must specify the file type, the output sample format, output
 channel count and output sample rate. The following file types are supported:
 
-    +------------------------+-------------+
-    | Enum                   | Description |
-    +------------------------+-------------+
-    | ma_encoding_format_wav | WAV         |
-    +------------------------+-------------+
+    +-------------------------+----------------------------------------------+
+    | Enum                    | Description                                  |
+    +-------------------------+----------------------------------------------+
+    | ma_encoding_format_wav  | WAV                                          |
+    | ma_encoding_format_aiff | AIFF for integer PCM, AIFC ("fl32") for f32 |
+    +-------------------------+----------------------------------------------+
 
 If the format, channel count or sample rate is not supported by the output file type an error will
 be returned. The encoder will not perform data conversion so you will need to convert it before
@@ -2708,6 +2710,14 @@ example below:
 
 The `framesWritten` variable will contain the number of PCM frames that were actually written. This
 is optionally and you can pass in `NULL` if you need this.
+
+The AIFF/AIFC encoder stores the total number of frames and the chunk sizes in their headers, which
+need to be backfilled after all audio data has been written. The output therefore needs to be
+seekable. Initializing an AIFF/AIFC encoder against a non-seekable output will fail with
+`MA_NOT_IMPLEMENTED`, which is distinct from the `MA_INVALID_ARGS` returned for an unsupported
+sample format. The supported sample formats are `ma_format_u8`, `ma_format_s16`, `ma_format_s24`,
+`ma_format_s32` and `ma_format_f32`. Integer PCM is written as plain big-endian AIFF while
+`ma_format_f32` is written as AIFC with the "fl32" compression code.
 
 Encoders must be uninitialized with `ma_encoder_uninit()`.
 
@@ -9941,7 +9951,8 @@ typedef enum
     ma_encoding_format_wav,
     ma_encoding_format_flac,
     ma_encoding_format_mp3,
-    ma_encoding_format_vorbis
+    ma_encoding_format_vorbis,
+    ma_encoding_format_aiff
 } ma_encoding_format;
 #endif
 
@@ -66491,7 +66502,7 @@ static ma_result ma_decoder_init__internal(ma_decoder_read_proc onRead, ma_decod
     /* If we've specified a specific encoding type, try that first. */
     if (pConfig->encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (pConfig->encodingFormat == ma_encoding_format_wav) {
+        if (pConfig->encodingFormat == ma_encoding_format_wav || pConfig->encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav__internal(pConfig, pDecoder);
         }
     #endif
@@ -66718,7 +66729,7 @@ MA_API ma_result ma_decoder_init_memory(const void* pData, size_t dataSize, cons
 
     if (config.encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (config.encodingFormat == ma_encoding_format_wav) {
+        if (config.encodingFormat == ma_encoding_format_wav || config.encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav_from_memory__internal(pData, dataSize, &config, pDecoder);
         }
     #endif
@@ -67057,7 +67068,7 @@ MA_API ma_result ma_decoder_init_vfs(ma_vfs* pVFS, const char* pFilePath, const 
 
     if (config.encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (config.encodingFormat == ma_encoding_format_wav) {
+        if (config.encodingFormat == ma_encoding_format_wav || config.encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav__internal(&config, pDecoder);
         }
     #endif
@@ -67188,7 +67199,7 @@ MA_API ma_result ma_decoder_init_vfs_w(ma_vfs* pVFS, const wchar_t* pFilePath, c
 
     if (config.encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (config.encodingFormat == ma_encoding_format_wav) {
+        if (config.encodingFormat == ma_encoding_format_wav || config.encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav__internal(&config, pDecoder);
         }
     #endif
@@ -67308,7 +67319,7 @@ MA_API ma_result ma_decoder_init_file(const char* pFilePath, const ma_decoder_co
 
     if (config.encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (config.encodingFormat == ma_encoding_format_wav) {
+        if (config.encodingFormat == ma_encoding_format_wav || config.encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav_from_file__internal(pFilePath, &config, pDecoder);
         }
     #endif
@@ -67450,7 +67461,7 @@ MA_API ma_result ma_decoder_init_file_w(const wchar_t* pFilePath, const ma_decod
 
     if (config.encodingFormat != ma_encoding_format_unknown) {
     #ifdef MA_HAS_WAV
-        if (config.encodingFormat == ma_encoding_format_wav) {
+        if (config.encodingFormat == ma_encoding_format_wav || config.encodingFormat == ma_encoding_format_aiff) {
             result = ma_decoder_init_wav_from_file_w__internal(pFilePath, &config, pDecoder);
         }
     #endif
@@ -68153,6 +68164,402 @@ static ma_result ma_encoder__on_write_pcm_frames_wav(ma_encoder* pEncoder, const
 }
 #endif
 
+
+#if defined(MA_HAS_WAV)
+/*
+The AIFF encoder is a self-contained, big-endian IFF writer. It outputs plain AIFF (form type
+"AIFF") for integer PCM, and AIFC (form type "AIFC", compression code "fl32") for 32-bit IEEE
+float. All multi-byte numbers are written big-endian. Chunks with an odd body size are followed by
+a zero pad byte. Because AIFF stores the total frame count in the COMM chunk and the FORM/SSND
+sizes in their chunk headers, the output needs to be seekable so those fields can be backfilled
+when the encoder is uninitialized.
+
+File layout:
+
+    "FORM" + formSize(BE32) + ("AIFF" | "AIFC")
+    "COMM" + 18 (AIFF) or 24 (AIFC)
+        channels(BE16), frameCount(BE32), bitsPerSample(BE16), sampleRate(80-bit extended)
+        [AIFC only: compressionCode(FOURCC) + compressionName(pascal string, padded)]
+    "SSND" + chunkSize(BE32)
+        offset(BE32)=0, blockSize(BE32)=0, sample data..., optional pad byte
+*/
+
+typedef struct
+{
+    ma_bool32 isAIFC;
+    ma_uint32 bytesPerSample;
+    ma_uint32 channels;
+    ma_uint64 framesWritten;
+    ma_uint64 dataSize;          /* Number of payload bytes written to the SSND chunk (excludes padding). */
+} ma_encoder_aiff;
+
+/* Fixed byte offsets of the fields that need to be backfilled when the encoder is uninitialized. */
+#define MA_ENCODER_AIFF_FORM_SIZE_POS         4    /* FORM chunk size. */
+#define MA_ENCODER_AIFF_COMM_FRAME_COUNT_POS  22   /* COMM frame count. */
+#define MA_ENCODER_AIFF_SSND_SIZE_POS_AIFF    42   /* SSND chunk size when using plain AIFF. */
+#define MA_ENCODER_AIFF_SSND_SIZE_POS_AIFC    48   /* SSND chunk size when using AIFC. */
+
+static ma_result ma_encoder_aiff__write(ma_encoder* pEncoder, const void* pData, size_t bytesToWrite)
+{
+    size_t bytesWritten = 0;
+    ma_result result;
+
+    MA_ASSERT(pEncoder != NULL);
+    MA_ASSERT(pData != NULL);
+
+    if (bytesToWrite == 0) {
+        return MA_SUCCESS;
+    }
+
+    result = pEncoder->onWrite(pEncoder, pData, bytesToWrite, &bytesWritten);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+    if (bytesWritten != bytesToWrite) {
+        return MA_ERROR;
+    }
+
+    return MA_SUCCESS;
+}
+
+static ma_result ma_encoder_aiff__write_u8(ma_encoder* pEncoder, ma_uint8 value)
+{
+    return ma_encoder_aiff__write(pEncoder, &value, sizeof(value));
+}
+
+static ma_result ma_encoder_aiff__write_be16(ma_encoder* pEncoder, ma_uint16 value)
+{
+    ma_uint8 bytes[2];
+
+    bytes[0] = (ma_uint8)((value >> 8) & 0xFF);
+    bytes[1] = (ma_uint8)((value >> 0) & 0xFF);
+
+    return ma_encoder_aiff__write(pEncoder, bytes, sizeof(bytes));
+}
+
+static ma_result ma_encoder_aiff__write_be32(ma_encoder* pEncoder, ma_uint32 value)
+{
+    ma_uint8 bytes[4];
+
+    bytes[0] = (ma_uint8)((value >> 24) & 0xFF);
+    bytes[1] = (ma_uint8)((value >> 16) & 0xFF);
+    bytes[2] = (ma_uint8)((value >>  8) & 0xFF);
+    bytes[3] = (ma_uint8)((value >>  0) & 0xFF);
+
+    return ma_encoder_aiff__write(pEncoder, bytes, sizeof(bytes));
+}
+
+/* Converts an integer sample rate into the 10-byte 80-bit IEEE 754 extended precision representation used by AIFF. */
+static void ma_encoder_aiff__sample_rate_to_extended(ma_uint32 sampleRate, ma_uint8 extended[10])
+{
+    ma_uint32 exponent;
+    ma_uint64 significand;
+    int shift;
+
+    MA_ZERO_MEMORY(extended, 10);
+
+    if (sampleRate == 0) {
+        return;
+    }
+
+    /*
+    Normalize so the significand has its most significant bit at bit 63. The stored significand is
+    64 bits and the biased exponent is (exponent + 16383).
+    */
+    significand = (ma_uint64)sampleRate;
+    shift = 0;
+    while ((significand & (ma_uint64)0x8000000000000000) == 0) {
+        significand <<= 1;
+        shift += 1;
+    }
+
+    exponent = (ma_uint32)((63 - shift) + 16383);
+
+    extended[0] = (ma_uint8)((exponent >> 8) & 0x7F);  /* Sign bit is always 0 for sample rates. */
+    extended[1] = (ma_uint8)((exponent >> 0) & 0xFF);
+    extended[2] = (ma_uint8)((significand >> 56) & 0xFF);
+    extended[3] = (ma_uint8)((significand >> 48) & 0xFF);
+    extended[4] = (ma_uint8)((significand >> 40) & 0xFF);
+    extended[5] = (ma_uint8)((significand >> 32) & 0xFF);
+    extended[6] = (ma_uint8)((significand >> 24) & 0xFF);
+    extended[7] = (ma_uint8)((significand >> 16) & 0xFF);
+    extended[8] = (ma_uint8)((significand >>  8) & 0xFF);
+    extended[9] = (ma_uint8)((significand >>  0) & 0xFF);
+}
+
+static ma_result ma_encoder_aiff__write_extended_sample_rate(ma_encoder* pEncoder, ma_uint32 sampleRate)
+{
+    ma_uint8 extended[10];
+
+    ma_encoder_aiff__sample_rate_to_extended(sampleRate, extended);
+    return ma_encoder_aiff__write(pEncoder, extended, sizeof(extended));
+}
+
+static ma_result ma_encoder_aiff__on_init(ma_encoder* pEncoder)
+{
+    ma_result result;
+    ma_encoder_aiff* pAIFF;
+    ma_uint32 commChunkSize;
+
+    MA_ASSERT(pEncoder != NULL);
+
+    /* Only formats with an exact, lossless AIFF/AIFC representation are supported. */
+    if (pEncoder->config.format != ma_format_u8 && pEncoder->config.format != ma_format_s16 &&
+        pEncoder->config.format != ma_format_s24 && pEncoder->config.format != ma_format_s32 &&
+        pEncoder->config.format != ma_format_f32) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* AIFF requires backfilling chunk sizes and the frame count, so the output must be seekable. */
+    result = pEncoder->onSeek(pEncoder, 0, ma_seek_origin_current);
+    if (result != MA_SUCCESS) {
+        return MA_NOT_IMPLEMENTED;
+    }
+
+    pAIFF = (ma_encoder_aiff*)ma_malloc(sizeof(*pAIFF), &pEncoder->config.allocationCallbacks);
+    if (pAIFF == NULL) {
+        return MA_OUT_OF_MEMORY;
+    }
+
+    MA_ZERO_OBJECT(pAIFF);
+    pAIFF->isAIFC         = (pEncoder->config.format == ma_format_f32) ? MA_TRUE : MA_FALSE;
+    pAIFF->bytesPerSample = ma_get_bytes_per_sample(pEncoder->config.format);
+    pAIFF->channels       = pEncoder->config.channels;
+
+    /* FORM header. The chunk size is backfilled on uninit. */
+    result = ma_encoder_aiff__write(pEncoder, "FORM", 4);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, 0);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write(pEncoder, pAIFF->isAIFC ? "AIFC" : "AIFF", 4);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+
+    /*
+    COMM chunk. The body is 18 bytes for AIFF and 24 bytes for AIFC (4 byte compression code plus a
+    2 byte padded pascal string holding an empty compression name). The frame count is backfilled
+    on uninit and is therefore written as zero for now.
+    */
+    commChunkSize = pAIFF->isAIFC ? 24u : 18u;
+    result = ma_encoder_aiff__write(pEncoder, "COMM", 4);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, commChunkSize);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be16(pEncoder, (ma_uint16)pEncoder->config.channels);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, 0);  /* Frame count - backfilled on uninit. */
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be16(pEncoder, (ma_uint16)(pAIFF->bytesPerSample * 8));
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_extended_sample_rate(pEncoder, pEncoder->config.sampleRate);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    if (pAIFF->isAIFC) {
+        /* Compression code "fl32" and an empty compression name pascal string (length 0, padded to even). */
+        result = ma_encoder_aiff__write(pEncoder, "fl32", 4);
+        if (result != MA_SUCCESS) {
+            goto failed;
+        }
+        result = ma_encoder_aiff__write_u8(pEncoder, 0);  /* Pascal string length. */
+        if (result != MA_SUCCESS) {
+            goto failed;
+        }
+        result = ma_encoder_aiff__write_u8(pEncoder, 0);  /* Pad so the chunk body stays at 24 bytes. */
+        if (result != MA_SUCCESS) {
+            goto failed;
+        }
+    }
+
+    /* SSND header. The chunk size is backfilled on uninit. */
+    result = ma_encoder_aiff__write(pEncoder, "SSND", 4);
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, 0);  /* Chunk size - backfilled on uninit. */
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, 0);  /* Offset. */
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, 0);  /* Block size. */
+    if (result != MA_SUCCESS) {
+        goto failed;
+    }
+
+    pEncoder->pInternalEncoder = pAIFF;
+    return MA_SUCCESS;
+
+failed:
+    ma_free(pAIFF, &pEncoder->config.allocationCallbacks);
+    return result;
+}
+
+static void ma_encoder_aiff__on_uninit(ma_encoder* pEncoder)
+{
+    ma_encoder_aiff* pAIFF;
+    ma_result result;
+
+    MA_ASSERT(pEncoder != NULL);
+
+    pAIFF = (ma_encoder_aiff*)pEncoder->pInternalEncoder;
+    if (pAIFF == NULL) {
+        return;
+    }
+
+    /* IFF chunks with an odd body size are followed by a zero pad byte. */
+    if (pAIFF->dataSize & 1) {
+        result = ma_encoder_aiff__write_u8(pEncoder, 0);
+        if (result != MA_SUCCESS) {
+            goto done;
+        }
+    }
+
+    /* Backfill the COMM frame count. */
+    result = pEncoder->onSeek(pEncoder, MA_ENCODER_AIFF_COMM_FRAME_COUNT_POS, ma_seek_origin_start);
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, (ma_uint32)pAIFF->framesWritten);
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+
+    /* Backfill the SSND chunk size (body = 8 byte offset/block header + payload). */
+    result = pEncoder->onSeek(pEncoder, pAIFF->isAIFC ? MA_ENCODER_AIFF_SSND_SIZE_POS_AIFC : MA_ENCODER_AIFF_SSND_SIZE_POS_AIFF, ma_seek_origin_start);
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+    result = ma_encoder_aiff__write_be32(pEncoder, (ma_uint32)(8 + pAIFF->dataSize));
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+
+    /* Backfill the FORM chunk size (everything after the 8 byte FORM header). */
+    result = pEncoder->onSeek(pEncoder, MA_ENCODER_AIFF_FORM_SIZE_POS, ma_seek_origin_start);
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+    {
+        ma_uint32 formSize = (ma_uint32)(
+            4 +                              /* Form type ("AIFF"/"AIFC"). */
+            (8 + (pAIFF->isAIFC ? 24u : 18u)) +  /* COMM chunk including header. */
+            (8 + 8 + (ma_uint32)pAIFF->dataSize) +  /* SSND chunk including header and offset/block. */
+            (pAIFF->dataSize & 1)            /* SSND pad byte. */
+        );
+        result = ma_encoder_aiff__write_be32(pEncoder, formSize);
+        if (result != MA_SUCCESS) {
+            goto done;
+        }
+    }
+
+    /*
+    The backfill seeks moved the cursor away from the end of the file. Restore it so that the output
+    ends up in the same state a plain file handle would be in after the headers are finalized.
+    */
+    result = pEncoder->onSeek(pEncoder, 0, ma_seek_origin_end);
+    if (result != MA_SUCCESS) {
+        goto done;
+    }
+
+done:
+    ma_free(pAIFF, &pEncoder->config.allocationCallbacks);
+    pEncoder->pInternalEncoder = NULL;
+}
+
+static ma_result ma_encoder_aiff__on_write_pcm_frames(ma_encoder* pEncoder, const void* pFramesIn, ma_uint64 frameCount, ma_uint64* pFramesWritten)
+{
+    ma_encoder_aiff* pAIFF;
+    ma_uint64 totalSamples;
+    ma_uint64 bytesToWrite;
+    ma_result result;
+    const ma_uint8* pSamples;
+    ma_uint8* pBuffer;
+    ma_uint64 iSample;
+    ma_uint32 bytesPerSample;
+
+    MA_ASSERT(pEncoder != NULL);
+    MA_ASSERT(pFramesIn != NULL);
+
+    pAIFF = (ma_encoder_aiff*)pEncoder->pInternalEncoder;
+    MA_ASSERT(pAIFF != NULL);
+
+    bytesPerSample = pAIFF->bytesPerSample;
+    totalSamples   = frameCount * (ma_uint64)pAIFF->channels;
+    bytesToWrite   = totalSamples * (ma_uint64)bytesPerSample;
+
+    /*
+    Sample data is big-endian in the file. On little-endian targets each sample needs its bytes
+    reversed. To avoid mutating the caller's buffer the converted data is staged through a heap
+    allocation. The 8-bit unsigned format additionally needs a bias conversion to the signed 8-bit
+    representation required by AIFF.
+    */
+    pBuffer = (ma_uint8*)ma_malloc((size_t)bytesToWrite, &pEncoder->config.allocationCallbacks);
+    if (pBuffer == NULL) {
+        if (pFramesWritten != NULL) {
+            *pFramesWritten = 0;
+        }
+        return MA_OUT_OF_MEMORY;
+    }
+
+    pSamples = (const ma_uint8*)pFramesIn;
+
+    if (bytesPerSample == 1) {
+        /* u8 -> signed 8-bit PCM. */
+        for (iSample = 0; iSample < totalSamples; iSample += 1) {
+            pBuffer[iSample] = (ma_uint8)((ma_int32)pSamples[iSample] - 128);
+        }
+    } else if (ma_is_little_endian()) {
+        ma_uint64 iByte;
+        for (iSample = 0; iSample < totalSamples; iSample += 1) {
+            const ma_uint8* pSrc = pSamples + (iSample * bytesPerSample);
+            ma_uint8* pDst       = pBuffer  + (iSample * bytesPerSample);
+            for (iByte = 0; iByte < bytesPerSample; iByte += 1) {
+                pDst[iByte] = pSrc[bytesPerSample - iByte - 1];
+            }
+        }
+    } else {
+        MA_COPY_MEMORY(pBuffer, pSamples, (size_t)bytesToWrite);
+    }
+
+    result = ma_encoder_aiff__write(pEncoder, pBuffer, (size_t)bytesToWrite);
+    ma_free(pBuffer, &pEncoder->config.allocationCallbacks);
+
+    if (result != MA_SUCCESS) {
+        if (pFramesWritten != NULL) {
+            *pFramesWritten = 0;
+        }
+        return result;
+    }
+
+    pAIFF->framesWritten += frameCount;
+    pAIFF->dataSize      += bytesToWrite;
+
+    if (pFramesWritten != NULL) {
+        *pFramesWritten = frameCount;
+    }
+
+    return MA_SUCCESS;
+}
+#endif
+
 MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate)
 {
     ma_encoder_config config;
@@ -68217,6 +68624,17 @@ MA_API ma_result ma_encoder_init__internal(ma_encoder_write_proc onWrite, ma_enc
             pEncoder->onInit           = ma_encoder__on_init_wav;
             pEncoder->onUninit         = ma_encoder__on_uninit_wav;
             pEncoder->onWritePCMFrames = ma_encoder__on_write_pcm_frames_wav;
+        #else
+            result = MA_NO_BACKEND;
+        #endif
+        } break;
+
+        case ma_encoding_format_aiff:
+        {
+        #if defined(MA_HAS_WAV)
+            pEncoder->onInit           = ma_encoder_aiff__on_init;
+            pEncoder->onUninit         = ma_encoder_aiff__on_uninit;
+            pEncoder->onWritePCMFrames = ma_encoder_aiff__on_write_pcm_frames;
         #else
             result = MA_NO_BACKEND;
         #endif

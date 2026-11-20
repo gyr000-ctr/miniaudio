@@ -1,3 +1,12 @@
+Unreleased
+==========
+* Added a built-in decoder for Apple's Core Audio Format (CAF). Uncompressed linear PCM is
+  supported, including little- and big-endian samples, packed and aligned-high 24-bit, signed and
+  unsigned 8-bit, 16/32-bit integer and 32/64-bit float. Compressed codecs are rejected with
+  `MA_NOT_IMPLEMENTED` so they can be distinguished from malformed files (`MA_INVALID_FILE`). Use
+  `MA_NO_CAF` to disable the decoder. See `ma_encoding_format_caf`.
+
+
 v0.11.26 - 2026-10-31
 =====================
 * Fixed a bug where the ends of sounds are cutoff. This affects `ma_sound`.

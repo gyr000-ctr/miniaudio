@@ -639,6 +639,8 @@ To run locally, you'll need to use emrun:
     +----------------------------------+--------------------------------------------------------------------+
     | MA_NO_MP3                        | Disables the built-in MP3 decoder.                                 |
     +----------------------------------+--------------------------------------------------------------------+
+    | MA_NO_CAF                        | Disables the built-in CAF decoder.                                 |
+    +----------------------------------+--------------------------------------------------------------------+
     | MA_NO_DEVICE_IO                  | Disables playback and recording. This will disable `ma_context`    |
     |                                  | and `ma_device` APIs. This is useful if you only want to use       |
     |                                  | miniaudio's data conversion and/or decoding APIs.                  |
@@ -2506,6 +2508,7 @@ devices and can be used independently. Built-in support is included for the foll
     | WAV     |
     | MP3     |
     | FLAC    |
+    | CAF     |
     +---------+
 
 You can disable the built-in decoders by specifying one or more of the following options before the
@@ -9941,7 +9944,8 @@ typedef enum
     ma_encoding_format_wav,
     ma_encoding_format_flac,
     ma_encoding_format_mp3,
-    ma_encoding_format_vorbis
+    ma_encoding_format_vorbis,
+    ma_encoding_format_caf
 } ma_encoding_format;
 #endif
 
@@ -65542,7 +65546,1129 @@ static ma_result ma_decoder_init_mp3_from_memory__internal(const void* pData, si
 }
 #endif  /* ma_dr_mp3_h */
 
-/* Vorbis */
+/* CAF (Apple Core Audio Format). LPCM only. */
+#if !defined(MA_NO_CAF) && !defined(MA_NO_DECODING)
+#define MA_HAS_CAF
+
+/*
+The Core Audio File format is a big-endian chunk based container. See Apple's "Core Audio Format
+Specification" (https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/).
+
+Only uncompressed linear PCM (kAudioFormatLinearPCM, four-character code 'lpcm') is supported. Any
+other codec (AAC, Apple Lossless, ...) is rejected during initialization with MA_NOT_IMPLEMENTED so
+that callers can distinguish an unsupported encoding from a malformed/truncated file
+(MA_INVALID_FILE).
+
+The decoder is fully streaming: it never buffers more than one PCM frame beyond the caller's own
+output buffer, so peak working memory is independent of the file size.
+*/
+
+/* Four-character codes as they appear on disk (always big-endian storage). */
+#define MA_CAF_MAKE_FOURCC(a, b, c, d) ((ma_uint32)((ma_uint32)(ma_uint8)(a) << 24 | (ma_uint32)(ma_uint8)(b) << 16 | (ma_uint32)(ma_uint8)(c) << 8 | (ma_uint32)(ma_uint8)(d)))
+#define MA_CAF_FILE_TYPE               MA_CAF_MAKE_FOURCC('c','a','f','f')
+#define MA_CAF_CHUNK_AUDIO_DESCRIPTION MA_CAF_MAKE_FOURCC('d','e','s','c')
+#define MA_CAF_CHUNK_AUDIO_DATA        MA_CAF_MAKE_FOURCC('d','a','t','a')
+#define MA_CAF_CHUNK_PACKET_TABLE      MA_CAF_MAKE_FOURCC('p','a','k','t')
+#define MA_CAF_AUDIO_FORMAT_LPCM       MA_CAF_MAKE_FOURCC('l','p','c','m')
+
+/* AudioFormatFlags (AudioStreamBasicDescription.mFormatFlags), from CoreAudio/CoreAudioTypes.h. */
+#define MA_CAF_FORMAT_FLAG_IS_FLOAT        0x00000001
+#define MA_CAF_FORMAT_FLAG_IS_BIG_ENDIAN   0x00000002
+#define MA_CAF_FORMAT_FLAG_IS_SIGNED_INTEGER 0x00000004
+#define MA_CAF_FORMAT_FLAG_IS_PACKED       0x00000008
+#define MA_CAF_FORMAT_FLAG_IS_NON_INTERLEAVED 0x00000020
+#define MA_CAF_FORMAT_FLAG_IS_ALIGNED_HIGH 0x00000040
+
+typedef struct
+{
+    ma_data_source_base ds;
+    ma_read_proc onRead;
+    ma_seek_proc onSeek;
+    ma_tell_proc onTell;
+    void* pReadSeekTellUserData;
+    ma_allocation_callbacks allocationCallbacks;
+    ma_format format;           /* Output format. One of u8, s16, s24, s32 or f32. */
+    ma_uint32 channels;
+    ma_uint32 sampleRate;
+    ma_uint32 bitsPerChannel;   /* From the desc chunk. */
+    ma_uint32 bytesPerPacket;   /* From the desc chunk. For CBR LPCM this is bytes per frame. */
+    ma_bool32 isFloat;
+    ma_bool32 isSigned;      /* Integer sign, from the IS_SIGNED_INTEGER flag. */
+    ma_bool32 isBigEndian;      /* Byte order of the samples as stored in the data chunk. */
+    ma_bool32 needsBSwap;       /* Samples need a byte swap to become native-endian. */
+    ma_bool32 isPacked24;       /* Packed 3-bytes-per-channel 24-bit integer. */
+    ma_bool32 isAlignedHigh24;  /* 24-bit integer carried in a 4-byte aligned-high container. */
+    ma_uint32 containerBytes;   /* Bytes occupied by one channel on disk. */
+    ma_uint64 dataChunkDataPos; /* Absolute file position of the first sample byte. */
+    ma_uint64 dataChunkDataSize;/* Number of sample bytes (0 if unknown/streaming). */
+    ma_uint64 totalPCMFrames;   /* From the pakt chunk, or derived from the data chunk. */
+    ma_uint64 cursorInPCMFrames;
+    ma_uint8* pScratch;         /* One-frame scratch buffer for endian/24-bit normalization. */
+    size_t scratchSize;
+    ma_bool32 ownsMemoryState;  /* MA_TRUE when the memory backend allocated pReadSeekTellUserData itself. */
+} ma_caf;
+
+MA_API ma_result ma_caf_init(ma_read_proc onRead, ma_seek_proc onSeek, ma_tell_proc onTell, void* pReadSeekTellUserData, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf);
+MA_API ma_result ma_caf_init_file(const char* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf);
+MA_API ma_result ma_caf_init_file_w(const wchar_t* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf);
+MA_API ma_result ma_caf_init_memory(const void* pData, size_t dataSize, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf);
+MA_API void ma_caf_uninit(ma_caf* pCaf, const ma_allocation_callbacks* pAllocationCallbacks);
+MA_API ma_result ma_caf_read_pcm_frames(ma_caf* pCaf, void* pFramesOut, ma_uint64 frameCount, ma_uint64* pFramesRead);
+MA_API ma_result ma_caf_seek_to_pcm_frame(ma_caf* pCaf, ma_uint64 frameIndex);
+MA_API ma_result ma_caf_get_data_format(ma_caf* pCaf, ma_format* pFormat, ma_uint32* pChannels, ma_uint32* pSampleRate, ma_channel* pChannelMap, size_t channelMapCap);
+MA_API ma_result ma_caf_get_cursor_in_pcm_frames(ma_caf* pCaf, ma_uint64* pCursor);
+MA_API ma_result ma_caf_get_length_in_pcm_frames(ma_caf* pCaf, ma_uint64* pLength);
+
+static ma_result ma_caf_ds_read(ma_data_source* pDataSource, void* pFramesOut, ma_uint64 frameCount, ma_uint64* pFramesRead)
+{
+    return ma_caf_read_pcm_frames((ma_caf*)pDataSource, pFramesOut, frameCount, pFramesRead);
+}
+
+static ma_result ma_caf_ds_seek(ma_data_source* pDataSource, ma_uint64 frameIndex)
+{
+    return ma_caf_seek_to_pcm_frame((ma_caf*)pDataSource, frameIndex);
+}
+
+static ma_result ma_caf_ds_get_data_format(ma_data_source* pDataSource, ma_format* pFormat, ma_uint32* pChannels, ma_uint32* pSampleRate, ma_channel* pChannelMap, size_t channelMapCap)
+{
+    return ma_caf_get_data_format((ma_caf*)pDataSource, pFormat, pChannels, pSampleRate, pChannelMap, channelMapCap);
+}
+
+static ma_result ma_caf_ds_get_cursor(ma_data_source* pDataSource, ma_uint64* pCursor)
+{
+    return ma_caf_get_cursor_in_pcm_frames((ma_caf*)pDataSource, pCursor);
+}
+
+static ma_result ma_caf_ds_get_length(ma_data_source* pDataSource, ma_uint64* pLength)
+{
+    return ma_caf_get_length_in_pcm_frames((ma_caf*)pDataSource, pLength);
+}
+
+static ma_data_source_vtable g_ma_caf_ds_vtable =
+{
+    ma_caf_ds_read,
+    ma_caf_ds_seek,
+    ma_caf_ds_get_data_format,
+    ma_caf_ds_get_cursor,
+    ma_caf_ds_get_length,
+    NULL,   /* onSetLooping */
+    0
+};
+
+/* Self-contained read state for opening a CAF directly from a block of memory. */
+typedef struct
+{
+    const ma_uint8* pData;
+    size_t dataSize;
+    size_t cursor;
+} ma_caf_memory_state;
+
+static ma_result ma_caf_memory_on_read(void* pUserData, void* pBufferOut, size_t bytesToRead, size_t* pBytesRead)
+{
+    ma_caf_memory_state* pState = (ma_caf_memory_state*)pUserData;
+    size_t bytesRemaining;
+
+    if (pBytesRead != NULL) {
+        *pBytesRead = 0;
+    }
+
+    bytesRemaining = pState->dataSize - pState->cursor;
+    if (bytesToRead > bytesRemaining) {
+        bytesToRead = bytesRemaining;
+    }
+
+    if (bytesToRead > 0) {
+        MA_COPY_MEMORY(pBufferOut, pState->pData + pState->cursor, bytesToRead);
+        pState->cursor += bytesToRead;
+    }
+
+    if (pBytesRead != NULL) {
+        *pBytesRead = bytesToRead;
+    }
+
+    return bytesToRead == 0 ? MA_AT_END : MA_SUCCESS;
+}
+
+static ma_result ma_caf_memory_on_seek(void* pUserData, ma_int64 byteOffset, ma_seek_origin origin)
+{
+    ma_caf_memory_state* pState = (ma_caf_memory_state*)pUserData;
+    ma_int64 target;
+
+    if (origin == ma_seek_origin_start) {
+        target = byteOffset;
+    } else if (origin == ma_seek_origin_current) {
+        target = (ma_int64)pState->cursor + byteOffset;
+    } else {
+        target = (ma_int64)pState->dataSize + byteOffset;
+    }
+
+    if (target < 0) {
+        target = 0;
+    }
+    if ((size_t)target > pState->dataSize) {
+        target = (ma_int64)pState->dataSize;
+    }
+
+    pState->cursor = (size_t)target;
+    return MA_SUCCESS;
+}
+
+static ma_result ma_caf_memory_on_tell(void* pUserData, ma_int64* pCursor)
+{
+    ma_caf_memory_state* pState = (ma_caf_memory_state*)pUserData;
+    *pCursor = (ma_int64)pState->cursor;
+    return MA_SUCCESS;
+}
+
+/* Read helpers. A short read (including end of file) is reported as MA_AT_END so truncated files can be detected. */
+static ma_result ma_caf_read_raw(ma_caf* pCaf, void* pDst, size_t bytesToRead, size_t* pBytesRead)
+{
+    ma_result result;
+    size_t bytesRead = 0;
+
+    result = pCaf->onRead(pCaf->pReadSeekTellUserData, pDst, bytesToRead, &bytesRead);
+    if (pBytesRead != NULL) {
+        *pBytesRead = bytesRead;
+    }
+
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    if (bytesRead < bytesToRead) {
+        return MA_AT_END;
+    }
+
+    return MA_SUCCESS;
+}
+
+static ma_result ma_caf_read_u32(ma_caf* pCaf, ma_uint32* pValue)
+{
+    ma_uint8 buffer[4];
+    ma_result result = ma_caf_read_raw(pCaf, buffer, sizeof(buffer), NULL);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pValue = ((ma_uint32)buffer[0] << 24) | ((ma_uint32)buffer[1] << 16) | ((ma_uint32)buffer[2] << 8) | ((ma_uint32)buffer[3] << 0);
+    return MA_SUCCESS;
+}
+
+static ma_result ma_caf_read_u64(ma_caf* pCaf, ma_uint64* pValue)
+{
+    ma_uint32 hi, lo;
+    ma_result result;
+
+    result = ma_caf_read_u32(pCaf, &hi);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    result = ma_caf_read_u32(pCaf, &lo);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pValue = ((ma_uint64)hi << 32) | (ma_uint64)lo;
+    return MA_SUCCESS;
+}
+
+static ma_result ma_caf_read_fourcc(ma_caf* pCaf, ma_uint32* pValue)
+{
+    /* A four-character code is stored as four raw bytes; reading it as a big-endian u32 keeps the comparison order natural. */
+    return ma_caf_read_u32(pCaf, pValue);
+}
+
+static ma_result ma_caf_read_float64(ma_caf* pCaf, double* pValue)
+{
+    ma_uint64 bits;
+    ma_result result = ma_caf_read_u64(pCaf, &bits);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    MA_COPY_MEMORY(pValue, &bits, sizeof(*pValue));
+    return MA_SUCCESS;
+}
+
+static ma_result ma_caf_seek_abs(ma_caf* pCaf, ma_int64 absolutePos)
+{
+    return pCaf->onSeek(pCaf->pReadSeekTellUserData, absolutePos, ma_seek_origin_start);
+}
+
+/*
+Reads a whole chunk header. Chunk headers are a four-character code followed by an int64 size. The
+size does not include the 12 bytes of the header itself. A size of -1 means the chunk extends to
+the end of the file (only legal for the final chunk, in practice the data chunk). The caller tracks
+the absolute file position so no tell callback is required.
+*/
+static ma_result ma_caf_read_chunk_header(ma_caf* pCaf, ma_uint32* pChunkType, ma_int64* pChunkSize)
+{
+    ma_uint64 sizeUnsigned;
+    ma_result result;
+
+    result = ma_caf_read_fourcc(pCaf, pChunkType);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    result = ma_caf_read_u64(pCaf, &sizeUnsigned);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pChunkSize = (ma_int64)sizeUnsigned;
+    return MA_SUCCESS;
+}
+
+/* Maps a validated desc chunk onto a native ma_format. Signed 8-bit has no native ma format and is widened to s16. */
+static ma_format ma_caf_pick_native_format(ma_bool32 isFloat, ma_bool32 isSigned, ma_uint32 bitsPerChannel)
+{
+    if (isFloat) {
+        if (bitsPerChannel == 32 || bitsPerChannel == 64) {
+            return ma_format_f32;   /* 64-bit float is widened to 32-bit on output. */
+        }
+        return ma_format_unknown;
+    }
+
+    /* Integer. */
+    if (bitsPerChannel == 1) {
+        return ma_format_unknown;   /* Packed 1-bit samples are not supported. */
+    } else if (bitsPerChannel == 8) {
+        return isSigned ? ma_format_s16 : ma_format_u8;
+    } else if (bitsPerChannel == 16) {
+        return ma_format_s16;
+    } else if (bitsPerChannel == 24) {
+        return ma_format_s24;
+    } else if (bitsPerChannel == 32) {
+        return ma_format_s32;
+    }
+
+    return ma_format_unknown;
+}
+
+static ma_result ma_caf_init_internal(const ma_decoding_backend_config* pConfig, ma_caf* pCaf)
+{
+    ma_result result;
+    ma_data_source_config dataSourceConfig;
+
+    if (pCaf == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ZERO_OBJECT(pCaf);
+    pCaf->format = ma_format_unknown;
+    pCaf->totalPCMFrames = 0;
+    pCaf->dataChunkDataPos = 0;
+    pCaf->dataChunkDataSize = 0;
+
+    if (pConfig != NULL && (pConfig->preferredFormat == ma_format_f32 || pConfig->preferredFormat == ma_format_s16 || pConfig->preferredFormat == ma_format_s24 || pConfig->preferredFormat == ma_format_s32 || pConfig->preferredFormat == ma_format_u8)) {
+        pCaf->format = pConfig->preferredFormat;
+    }
+
+    dataSourceConfig = ma_data_source_config_init();
+    dataSourceConfig.vtable = &g_ma_caf_ds_vtable;
+
+    result = ma_data_source_init(&dataSourceConfig, &pCaf->ds);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    return MA_SUCCESS;
+}
+
+/*
+Parses the container. On entry the read cursor must be at the start of the file. On failure the
+caller is expected to uninitialize the data source; this routine itself only frees what it
+allocated.
+*/
+static ma_result ma_caf_parse(ma_caf* pCaf)
+{
+    ma_uint32 fileType;
+    ma_uint16 fileVersion;
+    ma_uint16 fileFlags;
+    ma_bool32 haveDesc = MA_FALSE;
+    ma_bool32 haveData = MA_FALSE;
+    ma_uint32 descFormatID = 0;
+    ma_uint32 descFormatFlags = 0;
+    ma_uint32 descFramesPerPacket = 0;
+    ma_uint32 descChannelsPerFrame = 0;
+    ma_uint32 descBitsPerChannel = 0;
+    ma_uint32 descBytesPerPacket = 0;
+    ma_uint64 paktFrameCount = 0;
+    ma_bool32 havePakt = MA_FALSE;
+    ma_uint64 parsePos = 0;   /* Absolute file position maintained independently of any tell callback. */
+    ma_result result;
+
+    /* File header: 'caff' (4) + version u16 (2) + flags u16 (2). */
+    result = ma_caf_read_fourcc(pCaf, &fileType);
+    if (result != MA_SUCCESS) {
+        return MA_INVALID_FILE;
+    }
+    if (fileType != (ma_uint32)MA_CAF_FILE_TYPE) {
+        return MA_INVALID_FILE;   /* Not a CAF file. */
+    }
+
+    {
+        ma_uint8 versionFlags[4];
+        result = ma_caf_read_raw(pCaf, versionFlags, sizeof(versionFlags), NULL);
+        if (result != MA_SUCCESS) {
+            return MA_INVALID_FILE;
+        }
+        fileVersion = (ma_uint16)((versionFlags[0] << 8) | versionFlags[1]);
+        fileFlags   = (ma_uint16)((versionFlags[2] << 8) | versionFlags[3]);
+        (void)fileVersion;
+        (void)fileFlags;
+    }
+    parsePos = 8;
+
+    /* Walk the chunks. */
+    for (;;) {
+        ma_uint32 chunkType;
+        ma_int64 chunkSize;
+        ma_uint64 chunkBodyPos;
+        ma_uint64 nextChunkPos;
+        ma_bool32 isLastChunk;
+
+        result = ma_caf_read_chunk_header(pCaf, &chunkType, &chunkSize);
+        if (result != MA_SUCCESS) {
+            if (result == MA_AT_END) {
+                break;  /* Clean end of file after the last chunk. */
+            }
+            return MA_INVALID_FILE;
+        }
+        parsePos += 12;
+        chunkBodyPos = parsePos;
+
+        if (chunkSize < 0) {
+            /* A -1 size means "to end of file"; stop scanning after this chunk. */
+            isLastChunk = MA_TRUE;
+            nextChunkPos = 0;
+        } else {
+            isLastChunk = MA_FALSE;
+            nextChunkPos = chunkBodyPos + (ma_uint64)chunkSize;
+        }
+
+        if (chunkType == (ma_uint32)MA_CAF_CHUNK_AUDIO_DESCRIPTION) {
+            double sampleRate;
+            ma_uint32 bytesPerFrame;
+
+            if (chunkSize < 32) {
+                return MA_INVALID_FILE;
+            }
+
+            result = ma_caf_read_fourcc(pCaf, &descFormatID);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u32(pCaf, &descFormatFlags);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u32(pCaf, &descBytesPerPacket);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u32(pCaf, &descFramesPerPacket);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u32(pCaf, &descChannelsPerFrame);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u32(pCaf, &descBitsPerChannel);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_float64(pCaf, &sampleRate);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+
+            if (descFormatID != (ma_uint32)MA_CAF_AUDIO_FORMAT_LPCM) {
+                return MA_NOT_IMPLEMENTED;  /* Compressed/unknown codec. Distinct from a broken file. */
+            }
+
+            if (descChannelsPerFrame == 0 || descChannelsPerFrame > 255) {
+                return MA_INVALID_FILE;
+            }
+            if (descFramesPerPacket != 1) {
+                return MA_INVALID_FILE;      /* LPCM is always one frame per packet. */
+            }
+            if ((descFormatFlags & MA_CAF_FORMAT_FLAG_IS_NON_INTERLEAVED) != 0) {
+                return MA_NOT_IMPLEMENTED;  /* Non-interleaved (planar) layouts are not supported. */
+            }
+            if (sampleRate <= 0.0 || sampleRate > 4294967295.0) {
+                return MA_INVALID_FILE;
+            }
+
+            pCaf->channels = descChannelsPerFrame;
+            pCaf->sampleRate = (ma_uint32)sampleRate;
+            pCaf->bitsPerChannel = descBitsPerChannel;
+            pCaf->bytesPerPacket = descBytesPerPacket;
+            pCaf->isFloat = ((descFormatFlags & MA_CAF_FORMAT_FLAG_IS_FLOAT) != 0);
+            pCaf->isSigned = ((descFormatFlags & MA_CAF_FORMAT_FLAG_IS_SIGNED_INTEGER) != 0);
+            pCaf->isBigEndian = ((descFormatFlags & MA_CAF_FORMAT_FLAG_IS_BIG_ENDIAN) != 0);
+            pCaf->isPacked24 = (pCaf->isFloat == MA_FALSE && descBitsPerChannel == 24 &&
+                                (descFormatFlags & MA_CAF_FORMAT_FLAG_IS_PACKED) != 0 &&
+                                (descBytesPerPacket / descChannelsPerFrame) == 3);
+            pCaf->containerBytes = descBytesPerPacket / descChannelsPerFrame;
+            pCaf->isAlignedHigh24 = (pCaf->isFloat == MA_FALSE && descBitsPerChannel == 24 &&
+                                     (descFormatFlags & MA_CAF_FORMAT_FLAG_IS_ALIGNED_HIGH) != 0 &&
+                                     pCaf->containerBytes == 4);
+
+            /*
+            Sanity-check the geometry. For packed LPCM the byte count per frame must match the bit
+            depth; for aligned high LPCM each channel occupies a whole byte/word boundary.
+            */
+            if ((descFormatFlags & MA_CAF_FORMAT_FLAG_IS_PACKED) != 0) {
+                bytesPerFrame = (descBitsPerChannel * descChannelsPerFrame + 7) / 8;
+            } else {
+                /* Aligned high: each channel occupies a power-of-two container >= the bit depth. */
+                ma_uint32 containerBits = 8;
+                while (containerBits < descBitsPerChannel) {
+                    containerBits *= 2;
+                }
+                bytesPerFrame = (containerBits / 8) * descChannelsPerFrame;
+            }
+
+            if (descBytesPerPacket != bytesPerFrame) {
+                return MA_INVALID_FILE;
+            }
+
+            haveDesc = MA_TRUE;
+        } else if (chunkType == (ma_uint32)MA_CAF_CHUNK_AUDIO_DATA) {
+            ma_uint32 editCount;
+
+            if (chunkSize >= 0 && chunkSize < 4) {
+                return MA_INVALID_FILE;
+            }
+
+            /* Body starts with an edit count u32; samples follow immediately. */
+            result = ma_caf_read_u32(pCaf, &editCount);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            if (editCount != 0) {
+                return MA_NOT_IMPLEMENTED;  /* Edit lists (priming/remainder) are not supported. */
+            }
+
+            /* The edit count u32 has just been consumed; the next byte is the first sample byte. */
+            pCaf->dataChunkDataPos = chunkBodyPos + 4;
+
+            if (chunkSize < 0) {
+                pCaf->dataChunkDataSize = 0;  /* Unknown; length derived from pakt or stream EOF. */
+            } else {
+                pCaf->dataChunkDataSize = (ma_uint64)chunkSize - 4;
+            }
+
+            haveData = MA_TRUE;
+        } else if (chunkType == (ma_uint32)MA_CAF_CHUNK_PACKET_TABLE) {
+            ma_uint64 primingFrames;
+            ma_uint64 remainderFrames;
+
+            if (chunkSize < 24) {
+                return MA_INVALID_FILE;
+            }
+
+            /*
+            Per the CAF specification the start of a packet table body is three int64 values:
+            the number of valid frames, priming frames and remainder frames. Any trailing bytes are
+            a variable-length packet table which is irrelevant for constant-bit-rate LPCM.
+            */
+            result = ma_caf_read_u64(pCaf, &paktFrameCount);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u64(pCaf, &primingFrames);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            result = ma_caf_read_u64(pCaf, &remainderFrames);
+            if (result != MA_SUCCESS) {
+                return MA_INVALID_FILE;
+            }
+            (void)primingFrames;
+            (void)remainderFrames;
+
+            havePakt = MA_TRUE;
+        }
+
+        if (isLastChunk) {
+            break;  /* Final chunk (e.g. data with -1 size). */
+        }
+
+        result = ma_caf_seek_abs(pCaf, (ma_int64)nextChunkPos);
+        if (result != MA_SUCCESS) {
+            return MA_INVALID_FILE;
+        }
+        parsePos = nextChunkPos;
+    }
+
+    if (!haveDesc) {
+        return MA_INVALID_FILE;
+    }
+    if (!haveData) {
+        return MA_INVALID_FILE;
+    }
+
+    /* Resolve the output format before touching the data chunk. */
+    {
+        ma_format nativeFormat = ma_caf_pick_native_format(pCaf->isFloat, pCaf->isSigned, pCaf->bitsPerChannel);
+        if (nativeFormat == ma_format_unknown) {
+            return MA_NOT_IMPLEMENTED;
+        }
+        if (pCaf->format == ma_format_unknown) {
+            pCaf->format = nativeFormat;
+        }
+    }
+
+    /* Determine the length. The packet table is authoritative; otherwise derive it from the data chunk. */
+    if (havePakt) {
+        pCaf->totalPCMFrames = paktFrameCount;
+    } else if (pCaf->bytesPerPacket > 0 && pCaf->dataChunkDataSize > 0) {
+        pCaf->totalPCMFrames = pCaf->dataChunkDataSize / pCaf->bytesPerPacket;
+    } else {
+        pCaf->totalPCMFrames = 0;  /* Unknown length (streaming data chunk). */
+    }
+
+    /*
+    A byte swap is needed whenever the on-disk order differs from the host. miniaudio's output
+    formats are always native-endian.
+    */
+    pCaf->needsBSwap = (pCaf->isBigEndian != (ma_is_big_endian() == MA_TRUE));
+
+    /* Allocate the single-frame scratch buffer. Sized for the larger of on-disk and output frames. */
+    {
+        size_t bytesPerFrameIn = (size_t)pCaf->bytesPerPacket;
+        size_t bytesPerFrameOut = (size_t)ma_get_bytes_per_frame(pCaf->format, pCaf->channels);
+        size_t needed = bytesPerFrameIn;
+        if (bytesPerFrameOut > needed) {
+            needed = bytesPerFrameOut;
+        }
+        if (needed == 0) {
+            return MA_INVALID_FILE;
+        }
+
+        pCaf->pScratch = (ma_uint8*)ma_malloc(needed, &pCaf->allocationCallbacks);
+        if (pCaf->pScratch == NULL) {
+            return MA_OUT_OF_MEMORY;
+        }
+        pCaf->scratchSize = needed;
+    }
+
+    /* Park the cursor on the first sample byte. */
+    result = ma_caf_seek_abs(pCaf, (ma_int64)pCaf->dataChunkDataPos);
+    if (result != MA_SUCCESS) {
+        return MA_INVALID_FILE;
+    }
+    pCaf->cursorInPCMFrames = 0;
+
+    return MA_SUCCESS;
+}
+
+/* Byte-swap a multi-byte sample in place. Only 2, 3, 4 and 8 byte containers occur in LPCM CAF. */
+static void ma_caf_bswap_sample(ma_uint8* p, ma_uint32 byteCount)
+{
+    ma_uint32 i;
+    for (i = 0; i < byteCount / 2; i += 1) {
+        ma_uint8 tmp = p[i];
+        p[i] = p[byteCount - 1 - i];
+        p[byteCount - 1 - i] = tmp;
+    }
+}
+
+/*
+Converts one frame (all channels) from the on-disk LPCM layout into the configured output format.
+The on-disk frame is read into pCaf->pScratch first so this routine can normalize endianness and
+the 24-bit packing without a second allocation.
+*/
+static ma_result ma_caf_convert_frame(ma_caf* pCaf, void* pFrameOut)
+{
+    size_t bytesPerFrameIn = (size_t)pCaf->bytesPerPacket;
+    ma_result result;
+    ma_uint32 i;
+
+    result = ma_caf_read_raw(pCaf, pCaf->pScratch, bytesPerFrameIn, NULL);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    if (pCaf->needsBSwap) {
+        ma_uint32 containerBytes = bytesPerFrameIn / pCaf->channels;
+        for (i = 0; i < pCaf->channels; i += 1) {
+            ma_caf_bswap_sample(pCaf->pScratch + (size_t)i * containerBytes, containerBytes);
+        }
+    }
+
+    /*
+    Packed 24-bit integer. After the optional byte swap each 3-byte sample is in host order; repack
+    it into the fixed little-endian layout of ma_format_s24 so the result is correct on both
+    little- and big-endian hosts.
+    */
+    if (pCaf->isPacked24) {
+        ma_uint8 s24Frame[256 * 3];
+        ma_uint32 channelCount = pCaf->channels;
+        if (channelCount > 256) {
+            return MA_INVALID_FILE;
+        }
+        if (ma_is_little_endian()) {
+            /* Host order already matches the little-endian layout of ma_format_s24. */
+            ma_pcm_convert(pFrameOut, pCaf->format, pCaf->pScratch, ma_format_s24, (ma_uint64)channelCount, ma_dither_mode_none);
+        } else {
+            for (i = 0; i < channelCount; i += 1) {
+                const ma_uint8* pIn = pCaf->pScratch + (size_t)i * 3;  /* Big-endian host order. */
+                ma_uint8* pOut = s24Frame + (size_t)i * 3;             /* Little-endian ma s24. */
+                pOut[0] = pIn[2];
+                pOut[1] = pIn[1];
+                pOut[2] = pIn[0];
+            }
+            ma_pcm_convert(pFrameOut, pCaf->format, s24Frame, ma_format_s24, (ma_uint64)channelCount, ma_dither_mode_none);
+        }
+        return MA_SUCCESS;
+    }
+
+    /*
+    Aligned-high 24-bit in a 4-byte container. After the optional byte swap the container is
+    native-endian; the valid 24 bits are left aligned (the top 3 bytes). Extract them into a
+    tightly packed little-endian s24 frame, which is the fixed on-disk layout of ma_format_s24.
+    */
+    if (pCaf->isAlignedHigh24) {
+        ma_uint8 s24Frame[256 * 3];
+        ma_uint32 channelCount = pCaf->channels;
+        ma_int32 value;
+        if (channelCount > 256) {
+            return MA_INVALID_FILE;
+        }
+        for (i = 0; i < channelCount; i += 1) {
+            /* Arithmetic right shift sign-extends the left-aligned 24-bit value down to a native int32. */
+            value = ((ma_int32*)pCaf->pScratch)[i] >> 8;
+            s24Frame[i * 3 + 0] = (ma_uint8)(value & 0xFF);
+            s24Frame[i * 3 + 1] = (ma_uint8)((value >> 8) & 0xFF);
+            s24Frame[i * 3 + 2] = (ma_uint8)((value >> 16) & 0xFF);
+        }
+        ma_pcm_convert(pFrameOut, pCaf->format, s24Frame, ma_format_s24, (ma_uint64)channelCount, ma_dither_mode_none);
+        return MA_SUCCESS;
+    }
+
+    if (pCaf->isFloat && pCaf->bitsPerChannel == 64) {
+        /* Widen f64 to f32 one channel at a time, then let ma_pcm_convert handle the output format. */
+        float widened[256];
+        double* pInF64 = (double*)pCaf->pScratch;
+        if (pCaf->channels > 256) {
+            return MA_INVALID_FILE;
+        }
+        for (i = 0; i < pCaf->channels; i += 1) {
+            widened[i] = (float)pInF64[i];
+        }
+        ma_pcm_convert(pFrameOut, pCaf->format, widened, ma_format_f32, (ma_uint64)pCaf->channels, ma_dither_mode_none);
+        return MA_SUCCESS;
+    }
+
+    if (pCaf->isFloat) {
+        /* 32-bit float. */
+        ma_pcm_convert(pFrameOut, pCaf->format, pCaf->pScratch, ma_format_f32, (ma_uint64)pCaf->channels, ma_dither_mode_none);
+        return MA_SUCCESS;
+    }
+
+    /* Signed 8-bit integer has no native ma format; widen each channel to s16 first. */
+    if (pCaf->bitsPerChannel == 8 && pCaf->isSigned) {
+        ma_int16 widened[256];
+        if (pCaf->channels > 256) {
+            return MA_INVALID_FILE;
+        }
+        for (i = 0; i < pCaf->channels; i += 1) {
+            widened[i] = (ma_int16)((ma_int8)pCaf->pScratch[i]);
+        }
+        ma_pcm_convert(pFrameOut, pCaf->format, widened, ma_format_s16, (ma_uint64)pCaf->channels, ma_dither_mode_none);
+        return MA_SUCCESS;
+    }
+
+    /* Remaining byte-aligned integer formats map directly onto native ma formats. */
+    {
+        ma_format inputFormat;
+        switch (pCaf->bitsPerChannel)
+        {
+            case 8:  inputFormat = ma_format_u8;  break;  /* Unsigned 8-bit. */
+            case 16: inputFormat = ma_format_s16; break;
+            case 32: inputFormat = ma_format_s32; break;
+            default: return MA_NOT_IMPLEMENTED;
+        }
+
+        ma_pcm_convert(pFrameOut, pCaf->format, pCaf->pScratch, inputFormat, (ma_uint64)pCaf->channels, ma_dither_mode_none);
+    }
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_caf_init(ma_read_proc onRead, ma_seek_proc onSeek, ma_tell_proc onTell, void* pReadSeekTellUserData, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf)
+{
+    ma_result result;
+
+    result = ma_caf_init_internal(pConfig, pCaf);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    if (onRead == NULL || onSeek == NULL) {
+        return MA_INVALID_ARGS; /* onRead and onSeek are mandatory. */
+    }
+
+    pCaf->onRead = onRead;
+    pCaf->onSeek = onSeek;
+    pCaf->onTell = onTell;
+    pCaf->pReadSeekTellUserData = pReadSeekTellUserData;
+    if (pAllocationCallbacks != NULL) {
+        pCaf->allocationCallbacks = *pAllocationCallbacks;
+    }
+
+    result = ma_caf_parse(pCaf);
+    if (result != MA_SUCCESS) {
+        ma_data_source_uninit(&pCaf->ds);
+        return result;
+    }
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_caf_init_file(const char* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf)
+{
+    /*
+    There is no separate file-based path in this backend: the generic decoder machinery opens the
+    file through its VFS and then drives the callback-based init, so a file path init is routed
+    through ma_decoder_init_from_file__internal which falls back to the VFS path automatically.
+    */
+    (void)pFilePath;
+    (void)pConfig;
+    (void)pAllocationCallbacks;
+    (void)pCaf;
+    return MA_NOT_IMPLEMENTED;
+}
+
+MA_API ma_result ma_caf_init_file_w(const wchar_t* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf)
+{
+    (void)pFilePath;
+    (void)pConfig;
+    (void)pAllocationCallbacks;
+    (void)pCaf;
+    return MA_NOT_IMPLEMENTED;
+}
+
+MA_API ma_result ma_caf_init_memory(const void* pData, size_t dataSize, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_caf* pCaf)
+{
+    ma_result result;
+    ma_caf_memory_state* pState;
+
+    if (pData == NULL || dataSize == 0) {
+        return MA_INVALID_ARGS;
+    }
+
+    pState = (ma_caf_memory_state*)ma_malloc(sizeof(*pState), pAllocationCallbacks);
+    if (pState == NULL) {
+        return MA_OUT_OF_MEMORY;
+    }
+    pState->pData = (const ma_uint8*)pData;
+    pState->dataSize = dataSize;
+    pState->cursor = 0;
+
+    result = ma_caf_init(ma_caf_memory_on_read, ma_caf_memory_on_seek, ma_caf_memory_on_tell, pState, pConfig, pAllocationCallbacks, pCaf);
+    if (result != MA_SUCCESS) {
+        ma_free(pState, pAllocationCallbacks);
+        return result;
+    }
+
+    pCaf->ownsMemoryState = MA_TRUE;
+    return MA_SUCCESS;
+}
+
+MA_API void ma_caf_uninit(ma_caf* pCaf, const ma_allocation_callbacks* pAllocationCallbacks)
+{
+    if (pCaf == NULL) {
+        return;
+    }
+
+    if (pCaf->ownsMemoryState && pCaf->pReadSeekTellUserData != NULL) {
+        /* Only the memory-based init allocates this state; a callback-based init leaves it external. */
+        ma_free(pCaf->pReadSeekTellUserData, &pCaf->allocationCallbacks);
+        pCaf->pReadSeekTellUserData = NULL;
+    }
+
+    if (pCaf->pScratch != NULL) {
+        ma_free(pCaf->pScratch, &pCaf->allocationCallbacks);
+        pCaf->pScratch = NULL;
+    }
+
+    (void)pAllocationCallbacks;
+    ma_data_source_uninit(&pCaf->ds);
+}
+
+MA_API ma_result ma_caf_read_pcm_frames(ma_caf* pCaf, void* pFramesOut, ma_uint64 frameCount, ma_uint64* pFramesRead)
+{
+    ma_result result = MA_SUCCESS;
+    ma_uint64 totalFramesRead = 0;
+    ma_uint8* pRunningOut;
+    size_t bytesPerFrameOut;
+
+    if (pFramesRead != NULL) {
+        *pFramesRead = 0;
+    }
+
+    if (frameCount == 0) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (pCaf == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    bytesPerFrameOut = (size_t)ma_get_bytes_per_frame(pCaf->format, pCaf->channels);
+    if (bytesPerFrameOut == 0) {
+        return MA_INVALID_OPERATION;
+    }
+
+    pRunningOut = (ma_uint8*)pFramesOut;
+
+    while (totalFramesRead < frameCount) {
+        /* Stop at the known length so a -1 sized data chunk does not run into trailing bytes. */
+        if (pCaf->totalPCMFrames != 0 && pCaf->cursorInPCMFrames >= pCaf->totalPCMFrames) {
+            result = MA_AT_END;
+            break;
+        }
+
+        result = ma_caf_convert_frame(pCaf, pRunningOut);
+        if (result != MA_SUCCESS) {
+            break;
+        }
+
+        pRunningOut += bytesPerFrameOut;
+        totalFramesRead += 1;
+        pCaf->cursorInPCMFrames += 1;
+    }
+
+    if (pFramesRead != NULL) {
+        *pFramesRead = totalFramesRead;
+    }
+
+    /* Match the WAV backend: zero frames delivered means MA_AT_END. */
+    if (totalFramesRead == 0 && result == MA_SUCCESS) {
+        result = MA_AT_END;
+    }
+
+    return result;
+}
+
+MA_API ma_result ma_caf_seek_to_pcm_frame(ma_caf* pCaf, ma_uint64 frameIndex)
+{
+    ma_result result;
+    ma_uint64 targetByte;
+
+    if (pCaf == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (pCaf->bytesPerPacket == 0) {
+        return MA_INVALID_OPERATION;
+    }
+
+    /* Clamp to the known length so a seek past the end lands on the end rather than trailing data. */
+    if (pCaf->totalPCMFrames != 0 && frameIndex > pCaf->totalPCMFrames) {
+        frameIndex = pCaf->totalPCMFrames;
+    }
+
+    targetByte = pCaf->dataChunkDataPos + frameIndex * (ma_uint64)pCaf->bytesPerPacket;
+    result = ma_caf_seek_abs(pCaf, (ma_int64)targetByte);
+    if (result != MA_SUCCESS) {
+        return MA_BAD_SEEK;
+    }
+
+    pCaf->cursorInPCMFrames = frameIndex;
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_caf_get_data_format(ma_caf* pCaf, ma_format* pFormat, ma_uint32* pChannels, ma_uint32* pSampleRate, ma_channel* pChannelMap, size_t channelMapCap)
+{
+    /* Defaults for safety. */
+    if (pFormat != NULL) {
+        *pFormat = ma_format_unknown;
+    }
+    if (pChannels != NULL) {
+        *pChannels = 0;
+    }
+    if (pSampleRate != NULL) {
+        *pSampleRate = 0;
+    }
+    if (pChannelMap != NULL) {
+        MA_ZERO_MEMORY(pChannelMap, sizeof(*pChannelMap) * channelMapCap);
+    }
+
+    if (pCaf == NULL) {
+        return MA_INVALID_OPERATION;
+    }
+
+    if (pFormat != NULL) {
+        *pFormat = pCaf->format;
+    }
+    if (pChannels != NULL) {
+        *pChannels = pCaf->channels;
+    }
+    if (pSampleRate != NULL) {
+        *pSampleRate = pCaf->sampleRate;
+    }
+    if (pChannelMap != NULL) {
+        ma_channel_map_init_standard(ma_standard_channel_map_microsoft, pChannelMap, channelMapCap, pCaf->channels);
+    }
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_caf_get_cursor_in_pcm_frames(ma_caf* pCaf, ma_uint64* pCursor)
+{
+    if (pCursor == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pCursor = 0;
+
+    if (pCaf == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pCursor = pCaf->cursorInPCMFrames;
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_caf_get_length_in_pcm_frames(ma_caf* pCaf, ma_uint64* pLength)
+{
+    if (pLength == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pLength = 0;
+
+    if (pCaf == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pLength = pCaf->totalPCMFrames;
+    return MA_SUCCESS;
+}
+
+
+static ma_result ma_decoding_backend_init__caf(void* pUserData, ma_read_proc onRead, ma_seek_proc onSeek, ma_tell_proc onTell, void* pReadSeekTellUserData, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_data_source** ppBackend)
+{
+    ma_result result;
+    ma_caf* pCaf;
+
+    (void)pUserData;
+
+    pCaf = (ma_caf*)ma_malloc(sizeof(*pCaf), pAllocationCallbacks);
+    if (pCaf == NULL) {
+        return MA_OUT_OF_MEMORY;
+    }
+
+    result = ma_caf_init(onRead, onSeek, onTell, pReadSeekTellUserData, pConfig, pAllocationCallbacks, pCaf);
+    if (result != MA_SUCCESS) {
+        ma_free(pCaf, pAllocationCallbacks);
+        return result;
+    }
+
+    *ppBackend = pCaf;
+    return MA_SUCCESS;
+}
+
+static ma_result ma_decoding_backend_init_file__caf(void* pUserData, const char* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_data_source** ppBackend)
+{
+    /* No native file path support; the decoder falls back to VFS-driven callback init. */
+    (void)pUserData;
+    (void)pFilePath;
+    (void)pConfig;
+    (void)pAllocationCallbacks;
+    (void)ppBackend;
+    return MA_NOT_IMPLEMENTED;
+}
+
+static ma_result ma_decoding_backend_init_file_w__caf(void* pUserData, const wchar_t* pFilePath, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_data_source** ppBackend)
+{
+    (void)pUserData;
+    (void)pFilePath;
+    (void)pConfig;
+    (void)pAllocationCallbacks;
+    (void)ppBackend;
+    return MA_NOT_IMPLEMENTED;
+}
+
+static ma_result ma_decoding_backend_init_memory__caf(void* pUserData, const void* pData, size_t dataSize, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_data_source** ppBackend)
+{
+    ma_result result;
+    ma_caf* pCaf;
+
+    (void)pUserData;
+
+    if (pData == NULL || dataSize == 0) {
+        return MA_INVALID_ARGS;
+    }
+
+    pCaf = (ma_caf*)ma_malloc(sizeof(*pCaf), pAllocationCallbacks);
+    if (pCaf == NULL) {
+        return MA_OUT_OF_MEMORY;
+    }
+
+    result = ma_caf_init_memory(pData, dataSize, pConfig, pAllocationCallbacks, pCaf);
+    if (result != MA_SUCCESS) {
+        ma_free(pCaf, pAllocationCallbacks);
+        return result;
+    }
+
+    *ppBackend = (ma_data_source*)pCaf;
+    return MA_SUCCESS;
+}
+
+static void ma_decoding_backend_uninit__caf(void* pUserData, ma_data_source* pBackend, const ma_allocation_callbacks* pAllocationCallbacks)
+{
+    ma_caf* pCaf = (ma_caf*)pBackend;
+
+    (void)pUserData;
+
+    ma_caf_uninit(pCaf, pAllocationCallbacks);  /* Also releases any memory-backend read state. */
+    ma_free(pCaf, pAllocationCallbacks);
+}
+
+static ma_decoding_backend_vtable g_ma_decoding_backend_vtable_caf =
+{
+    ma_decoding_backend_init__caf,
+    ma_decoding_backend_init_file__caf,
+    ma_decoding_backend_init_file_w__caf,
+    ma_decoding_backend_init_memory__caf,
+    ma_decoding_backend_uninit__caf
+};
+
+static ma_result ma_decoder_init_caf__internal(const ma_decoder_config* pConfig, ma_decoder* pDecoder)
+{
+    return ma_decoder_init_from_vtable__internal(&g_ma_decoding_backend_vtable_caf, NULL, pConfig, pDecoder);
+}
+
+/*
+The CAF backend has no native file-path entry point. These open the file through miniaudio's VFS
+(ma_decoder_init_vfs is declared in the public API section above) and then drive the callback-based
+init, which is the fully supported streaming path.
+*/
+static ma_result ma_decoder_init_caf_from_file__internal(const char* pFilePath, const ma_decoder_config* pConfig, ma_decoder* pDecoder)
+{
+    return ma_decoder_init_vfs(NULL, pFilePath, pConfig, pDecoder);
+}
+
+static ma_result ma_decoder_init_caf_from_file_w__internal(const wchar_t* pFilePath, const ma_decoder_config* pConfig, ma_decoder* pDecoder)
+{
+    return ma_decoder_init_vfs_w(NULL, pFilePath, pConfig, pDecoder);
+}
+
+static ma_result ma_decoder_init_caf_from_memory__internal(const void* pData, size_t dataSize, const ma_decoder_config* pConfig, ma_decoder* pDecoder)
+{
+    return ma_decoder_init_from_memory__internal(&g_ma_decoding_backend_vtable_caf, NULL, pData, dataSize, pConfig, pDecoder);
+}
+#endif  /* MA_NO_CAF */
+
 #ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
 #define MA_HAS_VORBIS
 
@@ -66510,6 +67636,11 @@ static ma_result ma_decoder_init__internal(ma_decoder_read_proc onRead, ma_decod
             result = ma_decoder_init_vorbis__internal(pConfig, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (pConfig->encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf__internal(pConfig, pDecoder);
+        }
+    #endif
 
         /* If we weren't able to initialize the decoder, seek back to the start to give the next attempts a clean start. */
         if (result != MA_SUCCESS) {
@@ -66564,6 +67695,14 @@ static ma_result ma_decoder_init__internal(ma_decoder_read_proc onRead, ma_decod
     #ifdef MA_HAS_VORBIS
         if (result != MA_SUCCESS) {
             result = ma_decoder_init_vorbis__internal(pConfig, pDecoder);
+            if (result != MA_SUCCESS) {
+                onSeek(pDecoder, 0, ma_seek_origin_start);
+            }
+        }
+    #endif
+    #ifdef MA_HAS_CAF
+        if (result != MA_SUCCESS) {
+            result = ma_decoder_init_caf__internal(pConfig, pDecoder);
             if (result != MA_SUCCESS) {
                 onSeek(pDecoder, 0, ma_seek_origin_start);
             }
@@ -66737,6 +67876,11 @@ MA_API ma_result ma_decoder_init_memory(const void* pData, size_t dataSize, cons
             result = ma_decoder_init_vorbis_from_memory__internal(pData, dataSize, &config, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (config.encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf_from_memory__internal(pData, dataSize, &config, pDecoder);
+        }
+    #endif
     }
 
     if (result != MA_SUCCESS) {
@@ -66778,6 +67922,11 @@ MA_API ma_result ma_decoder_init_memory(const void* pData, size_t dataSize, cons
                 result = ma_decoder_init_vorbis_from_memory__internal(pData, dataSize, &config, pDecoder);
             }
         #endif
+        #ifdef MA_HAS_CAF
+            if (result != MA_SUCCESS) {
+                result = ma_decoder_init_caf_from_memory__internal(pData, dataSize, &config, pDecoder);
+            }
+        #endif
         }
     }
 
@@ -66812,6 +67961,7 @@ MA_API ma_result ma_decoder_init_memory(const void* pData, size_t dataSize, cons
 #if defined(MA_HAS_WAV)    || \
     defined(MA_HAS_MP3)    || \
     defined(MA_HAS_FLAC)   || \
+    defined(MA_HAS_CAF)    || \
     defined(MA_HAS_VORBIS)
 #define MA_HAS_PATH_API
 #endif
@@ -67076,6 +68226,11 @@ MA_API ma_result ma_decoder_init_vfs(ma_vfs* pVFS, const char* pFilePath, const 
             result = ma_decoder_init_vorbis__internal(&config, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (config.encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf__internal(&config, pDecoder);
+        }
+    #endif
 
         /* Make sure we seek back to the start if we didn't initialize a decoder successfully so the next attempts have a fresh start. */
         if (result != MA_SUCCESS) {
@@ -67122,6 +68277,14 @@ MA_API ma_result ma_decoder_init_vfs(ma_vfs* pVFS, const char* pFilePath, const 
     #ifdef MA_HAS_MP3
         if (result != MA_SUCCESS && ma_path_extension_equal(pFilePath, "mp3")) {
             result = ma_decoder_init_mp3__internal(&config, pDecoder);
+            if (result != MA_SUCCESS) {
+                ma_decoder__on_seek_vfs(pDecoder, 0, ma_seek_origin_start);
+            }
+        }
+    #endif
+    #ifdef MA_HAS_CAF
+        if (result != MA_SUCCESS && ma_path_extension_equal(pFilePath, "caf")) {
+            result = ma_decoder_init_caf__internal(&config, pDecoder);
             if (result != MA_SUCCESS) {
                 ma_decoder__on_seek_vfs(pDecoder, 0, ma_seek_origin_start);
             }
@@ -67207,6 +68370,11 @@ MA_API ma_result ma_decoder_init_vfs_w(ma_vfs* pVFS, const wchar_t* pFilePath, c
             result = ma_decoder_init_vorbis__internal(&config, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (config.encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf__internal(&config, pDecoder);
+        }
+    #endif
 
         /* Make sure we seek back to the start if we didn't initialize a decoder successfully so the next attempts have a fresh start. */
         if (result != MA_SUCCESS) {
@@ -67253,6 +68421,14 @@ MA_API ma_result ma_decoder_init_vfs_w(ma_vfs* pVFS, const wchar_t* pFilePath, c
     #ifdef MA_HAS_MP3
         if (result != MA_SUCCESS && ma_path_extension_equal_w(pFilePath, L"mp3")) {
             result = ma_decoder_init_mp3__internal(&config, pDecoder);
+            if (result != MA_SUCCESS) {
+                ma_decoder__on_seek_vfs(pDecoder, 0, ma_seek_origin_start);
+            }
+        }
+    #endif
+    #ifdef MA_HAS_CAF
+        if (result != MA_SUCCESS && ma_path_extension_equal_w(pFilePath, L"caf")) {
+            result = ma_decoder_init_caf__internal(&config, pDecoder);
             if (result != MA_SUCCESS) {
                 ma_decoder__on_seek_vfs(pDecoder, 0, ma_seek_origin_start);
             }
@@ -67327,6 +68503,11 @@ MA_API ma_result ma_decoder_init_file(const char* pFilePath, const ma_decoder_co
             result = ma_decoder_init_vorbis_from_file__internal(pFilePath, &config, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (config.encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf_from_file__internal(pFilePath, &config, pDecoder);
+        }
+    #endif
     }
 
     if (result != MA_SUCCESS) {
@@ -67365,6 +68546,11 @@ MA_API ma_result ma_decoder_init_file(const char* pFilePath, const ma_decoder_co
     #ifdef MA_HAS_VORBIS
         if (result != MA_SUCCESS && ma_path_extension_equal(pFilePath, "ogg")) {
             result = ma_decoder_init_vorbis_from_file__internal(pFilePath, &config, pDecoder);
+        }
+    #endif
+    #ifdef MA_HAS_CAF
+        if (result != MA_SUCCESS && ma_path_extension_equal(pFilePath, "caf")) {
+            result = ma_decoder_init_caf_from_file__internal(pFilePath, &config, pDecoder);
         }
     #endif
 
@@ -67469,6 +68655,11 @@ MA_API ma_result ma_decoder_init_file_w(const wchar_t* pFilePath, const ma_decod
             result = ma_decoder_init_vorbis_from_file_w__internal(pFilePath, &config, pDecoder);
         }
     #endif
+    #ifdef MA_HAS_CAF
+        if (config.encodingFormat == ma_encoding_format_caf) {
+            result = ma_decoder_init_caf_from_file_w__internal(pFilePath, &config, pDecoder);
+        }
+    #endif
     }
 
     if (result != MA_SUCCESS) {
@@ -67507,6 +68698,11 @@ MA_API ma_result ma_decoder_init_file_w(const wchar_t* pFilePath, const ma_decod
     #ifdef MA_HAS_VORBIS
         if (result != MA_SUCCESS && ma_path_extension_equal_w(pFilePath, L"ogg")) {
             result = ma_decoder_init_vorbis_from_file_w__internal(pFilePath, &config, pDecoder);
+        }
+    #endif
+    #ifdef MA_HAS_CAF
+        if (result != MA_SUCCESS && ma_path_extension_equal_w(pFilePath, L"caf")) {
+            result = ma_decoder_init_caf_from_file_w__internal(pFilePath, &config, pDecoder);
         }
     #endif
 

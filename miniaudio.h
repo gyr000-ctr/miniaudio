@@ -9962,6 +9962,7 @@ typedef struct
 {
     ma_format preferredFormat;
     ma_uint32 seekPointCount;   /* Set to > 0 to generate a seektable if the decoding backend supports it. */
+    ma_bool32 enableGapless;    /* Set to MA_TRUE to enable gapless playback trimming (encoder delay/padding) if the decoding backend supports it. */
 } ma_decoding_backend_config;
 
 MA_API ma_decoding_backend_config ma_decoding_backend_config_init(ma_format preferredFormat, ma_uint32 seekPointCount);
@@ -10008,6 +10009,7 @@ typedef struct
     ma_decoding_backend_vtable** ppCustomBackendVTables;
     ma_uint32 customBackendCount;
     void* pCustomBackendUserData;
+    ma_bool32 enable_gapless;   /* Set to MA_TRUE to trim encoder delay and padding based on gapless metadata (such as the MP3 LAME tag) for gapless playback. */
 } ma_decoder_config;
 
 struct ma_decoder
@@ -63271,6 +63273,7 @@ static ma_result ma_decoder_init_from_vtable__internal(const ma_decoding_backend
     }
 
     backendConfig = ma_decoding_backend_config_init(pConfig->format, pConfig->seekPointCount);
+    backendConfig.enableGapless = pConfig->enable_gapless;
 
     result = pVTable->onInit(pVTableUserData, ma_decoder_internal_on_read__custom, ma_decoder_internal_on_seek__custom, ma_decoder_internal_on_tell__custom, pDecoder, &backendConfig, &pDecoder->allocationCallbacks, &pBackend);
     if (result != MA_SUCCESS) {
@@ -63300,6 +63303,7 @@ static ma_result ma_decoder_init_from_file__internal(const ma_decoding_backend_v
     }
 
     backendConfig = ma_decoding_backend_config_init(pConfig->format, pConfig->seekPointCount);
+    backendConfig.enableGapless = pConfig->enable_gapless;
 
     result = pVTable->onInitFile(pVTableUserData, pFilePath, &backendConfig, &pDecoder->allocationCallbacks, &pBackend);
     if (result != MA_SUCCESS) {
@@ -63329,6 +63333,7 @@ static ma_result ma_decoder_init_from_file_w__internal(const ma_decoding_backend
     }
 
     backendConfig = ma_decoding_backend_config_init(pConfig->format, pConfig->seekPointCount);
+    backendConfig.enableGapless = pConfig->enable_gapless;
 
     result = pVTable->onInitFileW(pVTableUserData, pFilePath, &backendConfig, &pDecoder->allocationCallbacks, &pBackend);
     if (result != MA_SUCCESS) {
@@ -63358,6 +63363,7 @@ static ma_result ma_decoder_init_from_memory__internal(const ma_decoding_backend
     }
 
     backendConfig = ma_decoding_backend_config_init(pConfig->format, pConfig->seekPointCount);
+    backendConfig.enableGapless = pConfig->enable_gapless;
 
     result = pVTable->onInitMemory(pVTableUserData, pData, dataSize, &backendConfig, &pDecoder->allocationCallbacks, &pBackend);
     if (result != MA_SUCCESS) {
@@ -65031,6 +65037,40 @@ static ma_result ma_mp3_generate_seek_table(ma_mp3* pMP3, const ma_decoding_back
     return MA_SUCCESS;
 }
 
+static ma_result ma_mp3_configure_gapless(ma_mp3* pMP3, const ma_decoding_backend_config* pConfig)
+{
+    ma_bool32 enableGapless = MA_FALSE;
+
+    MA_ASSERT(pMP3 != NULL);
+
+    if (pConfig != NULL) {
+        enableGapless = pConfig->enableGapless;
+    }
+
+    if (enableGapless) {
+        /*
+        dr_mp3 will have picked up a non-zero encoder delay and/or padding if a LAME tag
+        was present in the stream. Validate those values against the total frame count to
+        guard against a corrupted tag before applying any trimming.
+        */
+        if (pMP3->dr.delayInPCMFrames > 0 || pMP3->dr.paddingInPCMFrames > 0) {
+            ma_uint64 totalPCMFrameCount = pMP3->dr.totalPCMFrameCount;
+            if (totalPCMFrameCount != MA_UINT64_MAX) {
+                ma_uint64 delayAndPadding = (ma_uint64)pMP3->dr.delayInPCMFrames + (ma_uint64)pMP3->dr.paddingInPCMFrames;
+                if (delayAndPadding >= totalPCMFrameCount) {
+                    return MA_INVALID_DATA; /* The LAME tag is corrupted. */
+                }
+            }
+        }
+    } else {
+        /* Gapless playback is disabled. Ignore any encoder delay/padding that was found in the LAME tag. */
+        pMP3->dr.delayInPCMFrames   = 0;
+        pMP3->dr.paddingInPCMFrames = 0;
+    }
+
+    return MA_SUCCESS;
+}
+
 static ma_result ma_mp3_post_init(ma_mp3* pMP3, const ma_decoding_backend_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks)
 {
     ma_result result;
@@ -65070,6 +65110,12 @@ MA_API ma_result ma_mp3_init(ma_read_proc onRead, ma_seek_proc onSeek, ma_tell_p
             return MA_INVALID_FILE;
         }
 
+        result = ma_mp3_configure_gapless(pMP3, pConfig);
+        if (result != MA_SUCCESS) {
+            ma_mp3_uninit(pMP3, pAllocationCallbacks);
+            return result;
+        }
+
         ma_mp3_post_init(pMP3, pConfig, pAllocationCallbacks);
 
         return MA_SUCCESS;
@@ -65099,6 +65145,12 @@ MA_API ma_result ma_mp3_init_file(const char* pFilePath, const ma_decoding_backe
         mp3Result = ma_dr_mp3_init_file(&pMP3->dr, pFilePath, pAllocationCallbacks);
         if (mp3Result != MA_TRUE) {
             return MA_INVALID_FILE;
+        }
+
+        result = ma_mp3_configure_gapless(pMP3, pConfig);
+        if (result != MA_SUCCESS) {
+            ma_mp3_uninit(pMP3, pAllocationCallbacks);
+            return result;
         }
 
         ma_mp3_post_init(pMP3, pConfig, pAllocationCallbacks);
@@ -65133,6 +65185,12 @@ MA_API ma_result ma_mp3_init_file_w(const wchar_t* pFilePath, const ma_decoding_
             return MA_INVALID_FILE;
         }
 
+        result = ma_mp3_configure_gapless(pMP3, pConfig);
+        if (result != MA_SUCCESS) {
+            ma_mp3_uninit(pMP3, pAllocationCallbacks);
+            return result;
+        }
+
         ma_mp3_post_init(pMP3, pConfig, pAllocationCallbacks);
 
         return MA_SUCCESS;
@@ -65163,6 +65221,12 @@ MA_API ma_result ma_mp3_init_memory(const void* pData, size_t dataSize, const ma
         mp3Result = ma_dr_mp3_init_memory(&pMP3->dr, pData, dataSize, pAllocationCallbacks);
         if (mp3Result != MA_TRUE) {
             return MA_INVALID_FILE;
+        }
+
+        result = ma_mp3_configure_gapless(pMP3, pConfig);
+        if (result != MA_SUCCESS) {
+            ma_mp3_uninit(pMP3, pAllocationCallbacks);
+            return result;
         }
 
         ma_mp3_post_init(pMP3, pConfig, pAllocationCallbacks);
@@ -66515,6 +66579,14 @@ static ma_result ma_decoder_init__internal(ma_decoder_read_proc onRead, ma_decod
         if (result != MA_SUCCESS) {
             onSeek(pDecoder, 0, ma_seek_origin_start);
         }
+
+        /*
+        If the backend recognized the encoding but reported that the data itself is corrupt
+        (MA_INVALID_DATA), don't bother falling back to trial and error with other backends.
+        */
+        if (result == MA_INVALID_DATA) {
+            return result;
+        }
     }
 
     if (result != MA_SUCCESS) {
@@ -66557,6 +66629,9 @@ static ma_result ma_decoder_init__internal(ma_decoder_read_proc onRead, ma_decod
         if (result != MA_SUCCESS) {
             result = ma_decoder_init_mp3__internal(pConfig, pDecoder);
             if (result != MA_SUCCESS) {
+                if (result == MA_INVALID_DATA) {
+                    return result;  /* The stream was recognized as MP3, but its data is corrupt. No need to try other backends. */
+                }
                 onSeek(pDecoder, 0, ma_seek_origin_start);
             }
         }
@@ -66771,6 +66846,9 @@ MA_API ma_result ma_decoder_init_memory(const void* pData, size_t dataSize, cons
         #ifdef MA_HAS_MP3
             if (result != MA_SUCCESS) {
                 result = ma_decoder_init_mp3_from_memory__internal(pData, dataSize, &config, pDecoder);
+                if (result == MA_INVALID_DATA) {
+                    return result;  /* The data was recognized as MP3, but is corrupt. No need to try other backends. */
+                }
             }
         #endif
         #ifdef MA_HAS_VORBIS
